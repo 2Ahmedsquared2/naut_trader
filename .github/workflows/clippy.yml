@@ -1,0 +1,40 @@
+name: Clippy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-clippy-
+            ${{ runner.os }}-cargo-
+
+      - name: Run Clippy
+        # Gate matches hypersdk-style branch protection (required check name: Clippy).
+        # Allow a few noisy lints so the gate is usable on this large workspace.
+        run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::too_many_arguments -A clippy::large_enum_variant -A clippy::module_name_repetitions
