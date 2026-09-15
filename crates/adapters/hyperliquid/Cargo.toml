@@ -130,6 +130,18 @@ harness = false
 name = "micros"
 harness = false
 
+[[bench]]
+name = "submit_path"
+harness = false
+
+[[bench]]
+name = "l2_book"
+harness = false
+
+[[bench]]
+name = "alloc_probe"
+harness = false
+
 [[bin]]
 name = "hyperliquid-http-public"
 path = "bin/http_public.rs"
