@@ -17,7 +17,8 @@
 //!
 //! Fixtures live as inline `&'static str` consts to keep benches deterministic
 //! and self-contained; real venue captures in `test_data/` are reserved for
-//! parser correctness tests.
+//! parser correctness tests. The L2 benches use generated 20-level-per-side
+//! frames from [`l2_book_20_json`] rather than the 10-level [`fixtures::BOOK_L2`].
 //!
 //! Each criterion bench is a separate compilation unit that pulls in this
 //! module, but uses only a subset of the benchmark routines and fixtures. Without the
@@ -26,21 +27,37 @@
 
 #![allow(dead_code)]
 
+use std::{fmt::Write, str::FromStr};
+
 use ahash::AHashMap;
 use nautilus_common::{cache::Cache, messages::ExecutionEvent};
-use nautilus_core::{AtomicTime, UnixNanos, time::get_atomic_clock_realtime};
-use nautilus_hyperliquid::common::consts::HYPERLIQUID_VENUE;
+use nautilus_core::{
+    AtomicTime, UUID4, UnixNanos, time::get_atomic_clock_realtime,
+};
+use nautilus_hyperliquid::{
+    HyperliquidHttpClient,
+    common::{consts::HYPERLIQUID_VENUE, enums::HyperliquidEnvironment},
+};
 use nautilus_live::ExecutionEventEmitter;
 use nautilus_model::{
-    enums::AccountType,
-    identifiers::{AccountId, InstrumentId, Symbol, TraderId},
-    instruments::{CryptoPerpetual, InstrumentAny},
+    enums::{AccountType, OrderSide, TimeInForce, TriggerType},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, Symbol, TraderId},
+    instruments::{CryptoPerpetual, Instrument, InstrumentAny},
+    orders::{LimitOrder, MarketOrder, OrderAny, StopMarketOrder},
     types::{Currency, Price, Quantity},
 };
+use rust_decimal::Decimal;
 use ustr::Ustr;
 
 pub(crate) const TRADER_ID: &str = "BENCH-001";
 pub(crate) const ACCOUNT_ID: &str = "HYPERLIQUID-001";
+pub(crate) const TEST_KEY: &str =
+    "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+pub(crate) const BTC_ASSET_INDEX: u32 = 3;
+pub(crate) const PRICE_DECIMALS: u8 = 2;
+pub(crate) const DEFAULT_SLIPPAGE_BPS: u32 = 50;
+pub(crate) const L2_LEVELS_PER_SIDE: usize = 20;
+pub(crate) const L2_COINS: &[&str] = &["BTC", "ETH", "SOL", "ARB"];
 
 #[must_use]
 pub(crate) fn clock() -> &'static AtomicTime {
@@ -65,6 +82,16 @@ pub(crate) fn btc_perp() -> InstrumentAny {
 #[must_use]
 pub(crate) fn eth_perp() -> InstrumentAny {
     perp_instrument("ETH", 2, 4)
+}
+
+#[must_use]
+pub(crate) fn sol_perp() -> InstrumentAny {
+    perp_instrument("SOL", 2, 4)
+}
+
+#[must_use]
+pub(crate) fn arb_perp() -> InstrumentAny {
+    perp_instrument("ARB", 4, 4)
 }
 
 fn perp_instrument(coin: &str, price_precision: u8, size_precision: u8) -> InstrumentAny {
@@ -127,6 +154,202 @@ pub(crate) fn bench_emitter() -> (
 #[must_use]
 pub(crate) fn empty_cache() -> Cache {
     Cache::default()
+}
+
+#[must_use]
+pub(crate) fn strategy_id() -> StrategyId {
+    StrategyId::from("S-BENCH")
+}
+
+#[must_use]
+pub(crate) fn client_order_id(suffix: &str) -> ClientOrderId {
+    ClientOrderId::from(format!("O-BENCH-{suffix}").as_str())
+}
+
+#[must_use]
+pub(crate) fn limit_order(side: OrderSide) -> OrderAny {
+    OrderAny::Limit(LimitOrder::new(
+        trader_id(),
+        strategy_id(),
+        btc_perp().id(),
+        client_order_id("LIM"),
+        side,
+        Quantity::from("0.001"),
+        Price::from("92572.0"),
+        TimeInForce::Gtc,
+        None,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+    ))
+}
+
+/// Constructs a market order the way production conversion receives it.
+///
+/// `MarketOrder` has no limit price, so
+/// `order_to_hyperliquid_request_with_asset_and_cloid` writes `Decimal::ZERO`.
+/// Production then overlays `derive_market_order_price` from a cached quote
+/// inside `submit_order` (execution.rs:826), which is excluded from these
+/// benches and must not be reimplemented here.
+#[must_use]
+pub(crate) fn market_order(side: OrderSide) -> OrderAny {
+    OrderAny::Market(MarketOrder::new(
+        trader_id(),
+        strategy_id(),
+        btc_perp().id(),
+        client_order_id("MKT"),
+        side,
+        Quantity::from("0.001"),
+        TimeInForce::Ioc,
+        UUID4::new(),
+        UnixNanos::default(),
+        false,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ))
+}
+
+#[must_use]
+pub(crate) fn stop_market_order(side: OrderSide) -> OrderAny {
+    OrderAny::StopMarket(StopMarketOrder::new(
+        trader_id(),
+        strategy_id(),
+        btc_perp().id(),
+        client_order_id("STP"),
+        side,
+        Quantity::from("0.001"),
+        Price::from("90000.0"),
+        TriggerType::LastPrice,
+        TimeInForce::Gtc,
+        None,
+        false,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+    ))
+}
+
+/// Authenticated HTTP client used only so benches can call
+/// [`HyperliquidHttpClient::sign_action_exec_request`].
+#[must_use]
+pub(crate) fn signed_http_client() -> HyperliquidHttpClient {
+    HyperliquidHttpClient::from_credentials(
+        TEST_KEY,
+        None,
+        HyperliquidEnvironment::Mainnet,
+        60,
+        None,
+    )
+    .expect("bench fixture private key must construct a signer")
+}
+
+#[must_use]
+pub(crate) fn l2_instrument(coin: &str) -> InstrumentAny {
+    match coin {
+        "BTC" => btc_perp(),
+        "ETH" => eth_perp(),
+        "SOL" => sol_perp(),
+        "ARB" => arb_perp(),
+        other => panic!("unknown L2 bench coin: {other}"),
+    }
+}
+
+#[must_use]
+pub(crate) fn l2_best_bid_tick(coin: &str) -> (&'static str, &'static str) {
+    match coin {
+        "BTC" => ("98450.5", "0.5"),
+        "ETH" => ("2114.25", "0.05"),
+        "SOL" => ("94.88", "0.01"),
+        "ARB" => ("0.3524", "0.0001"),
+        other => panic!("unknown L2 bench coin: {other}"),
+    }
+}
+
+#[must_use]
+pub(crate) fn l2_json_for_coin(coin: &str) -> String {
+    let (best_bid, tick) = l2_best_bid_tick(coin);
+    l2_book_20_json(coin, best_bid, tick)
+}
+
+/// Builds a venue-shaped `l2Book` JSON frame with 20 levels per side.
+///
+/// `best_bid` and `tick` are decimal strings. Bids descend from `best_bid` by
+/// `tick`; asks ascend from `best_bid + tick` by `tick`. Sizes vary slightly by
+/// level so the payload is not a repeated constant.
+#[must_use]
+pub(crate) fn l2_book_20_json(coin: &str, best_bid: &str, tick: &str) -> String {
+    let best_bid = Decimal::from_str(best_bid).expect("best_bid must be a decimal");
+    let tick = Decimal::from_str(tick).expect("tick must be a decimal");
+    let mut bids = String::new();
+    let mut asks = String::new();
+
+    for i in 0..L2_LEVELS_PER_SIDE {
+        if i > 0 {
+            bids.push(',');
+            asks.push(',');
+        }
+        let bid_px = best_bid - tick * Decimal::from(i as u64);
+        let ask_px = best_bid + tick * Decimal::from((i + 1) as u64);
+        let bid_sz = Decimal::new(25 + i as i64 * 3, 1);
+        let ask_sz = Decimal::new(15 + i as i64 * 2, 1);
+        let n = (i % 4) + 1;
+        write!(
+            bids,
+            r#"{{"px":"{}","sz":"{}","n":{}}}"#,
+            bid_px.normalize(),
+            bid_sz.normalize(),
+            n,
+        )
+        .expect("writing to String is infallible");
+        write!(
+            asks,
+            r#"{{"px":"{}","sz":"{}","n":{}}}"#,
+            ask_px.normalize(),
+            ask_sz.normalize(),
+            n,
+        )
+        .expect("writing to String is infallible");
+    }
+    let mut json = String::new();
+    json.push_str(r#"{"channel":"l2Book","data":{"coin":""#);
+    json.push_str(coin);
+    json.push_str(r#"","levels":[["#);
+    json.push_str(&bids);
+    json.push_str("],[");
+    json.push_str(&asks);
+    json.push_str(r#"]],"time":1733833200000}}"#);
+    json
 }
 
 pub(crate) mod fixtures {
